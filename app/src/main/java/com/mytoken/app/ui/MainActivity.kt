@@ -2,6 +2,8 @@ package com.mytoken.app.ui
 
 import android.Manifest
 import android.app.Application
+import android.content.Intent
+import android.provider.Settings
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -41,6 +43,7 @@ import com.mytoken.app.data.display
 import com.mytoken.app.export.Exporter
 import com.mytoken.app.logic.Insight
 import com.mytoken.app.logic.Insights
+import com.mytoken.app.parser.KplcParser
 import com.mytoken.app.sms.SmsScanner
 import com.mytoken.app.widget.DaysWidget
 import com.mytoken.app.work.ReminderWorker
@@ -92,6 +95,18 @@ class MainVm(app: Application) : AndroidViewModel(app) {
                 r == 0 -> "No new KPLC tokens found"
                 else -> "Found $r new token(s)"
             }
+            DaysWidget.refresh(ctx)
+        }
+    }
+
+    fun importText(text: String) {
+        viewModelScope.launch {
+            var n = 0
+            for (chunk in text.split(Regex("\\n\\s*\\n"))) {
+                val p = KplcParser.parse(chunk, null) ?: continue
+                if (SmsScanner.save(dao, p)) n++
+            }
+            message.value = if (n > 0) "Imported $n token(s)" else "No KPLC token found in that text"
             DaysWidget.refresh(ctx)
         }
     }
@@ -221,7 +236,11 @@ fun App(vm: MainVm) {
         }
     }
 
-    val permLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { vm.scan() }
+    var showHelp by remember { mutableStateOf(false) }
+    var showPaste by remember { mutableStateOf(false) }
+    val permLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { res ->
+        if (res[Manifest.permission.READ_SMS] == true) vm.scan() else showHelp = true
+    }
     val askAndScan: () -> Unit = {
         val perms = mutableListOf(Manifest.permission.READ_SMS, Manifest.permission.RECEIVE_SMS)
         if (Build.VERSION.SDK_INT >= 33) perms.add(Manifest.permission.POST_NOTIFICATIONS)
@@ -257,14 +276,55 @@ fun App(vm: MainVm) {
     ) { pad ->
         Box(Modifier.padding(pad)) {
             if (tracked.isEmpty()) {
-                Setup(meters, purchases, askAndScan, { showAdd = true }, vm::setTracked)
+                Setup(meters, purchases, askAndScan, { showAdd = true }, { showPaste = true }, vm::setTracked)
             } else when (tab) {
                 0 -> Home(vm, tracked, selected, purchases)
                 1 -> Charts(vm, tracked, selected, purchases)
                 2 -> MetersTab(vm, meters, purchases, askAndScan)
-                else -> MoreTab(vm, askAndScan)
+                else -> MoreTab(vm, askAndScan) { showPaste = true }
             }
         }
+    }
+
+    if (showHelp) {
+        AlertDialog(
+            onDismissRequest = { showHelp = false },
+            title = { Text("SMS permission is blocked") },
+            text = {
+                Text(
+                    "Android blocks SMS access for apps installed outside the Play Store. To allow it:\n\n" +
+                        "1. Tap Open app settings.\n" +
+                        "2. Tap the three-dot menu (top right) and choose Allow restricted settings. Confirm with your PIN or fingerprint.\n" +
+                        "3. Go to Permissions, then SMS, then Allow.\n" +
+                        "4. Come back here and tap Scan again.\n\n" +
+                        "No luck? Use Paste a token message instead."
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    showHelp = false
+                    ctx.startActivity(
+                        Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, android.net.Uri.fromParts("package", ctx.packageName, null))
+                            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    )
+                }) { Text("Open app settings") }
+            },
+            dismissButton = { TextButton(onClick = { showHelp = false }) { Text("Close") } }
+        )
+    }
+
+    if (showPaste) {
+        TextDialog(
+            title = "Paste token message(s)",
+            label = "Paste your KPLC SMS here",
+            initial = "",
+            numeric = false,
+            onDismiss = { showPaste = false },
+            onDone = { t ->
+                vm.importText(t)
+                showPaste = false
+            }
+        )
     }
 
     if (showAdd) {
@@ -285,6 +345,7 @@ fun Setup(
     purchases: List<Purchase>,
     onScan: () -> Unit,
     onAdd: () -> Unit,
+    onPaste: () -> Unit,
     onTrack: (String, Boolean) -> Unit
 ) {
     Column(Modifier.padding(20.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(14.dp)) {
@@ -292,6 +353,7 @@ fun Setup(
             Text("Welcome to MyToken", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
             Text("MyToken finds your KPLC token messages, saves every token and tells you when you are about to run out of units.")
             Button(onClick = onScan, modifier = Modifier.fillMaxWidth()) { Text("Scan my messages") }
+            OutlinedButton(onClick = onPaste, modifier = Modifier.fillMaxWidth()) { Text("Paste a token message") }
             OutlinedButton(onClick = onAdd, modifier = Modifier.fillMaxWidth()) { Text("Add a token manually") }
             Text(
                 "Scanning needs permission to read your SMS. Everything stays on your phone.",
@@ -503,7 +565,7 @@ fun MetersTab(vm: MainVm, meters: List<Meter>, purchases: List<Purchase>, onScan
 }
 
 @Composable
-fun MoreTab(vm: MainVm, onScan: () -> Unit) {
+fun MoreTab(vm: MainVm, onScan: () -> Unit, onPaste: () -> Unit) {
     val ctx = LocalContext.current
     val threshold by vm.threshold.collectAsState()
     val backupLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/json")) { uri ->
@@ -529,6 +591,7 @@ fun MoreTab(vm: MainVm, onScan: () -> Unit) {
         OutlinedButton(onClick = { restoreLauncher.launch(arrayOf("application/json", "*/*")) }, modifier = Modifier.fillMaxWidth()) { Text("Restore from backup") }
         HorizontalDivider()
         OutlinedButton(onClick = onScan, modifier = Modifier.fillMaxWidth()) { Text("Rescan messages") }
+        OutlinedButton(onClick = onPaste, modifier = Modifier.fillMaxWidth()) { Text("Paste a token message") }
         Text(
             "New KPLC token messages are saved automatically when they arrive. Home-screen widget: long-press your home screen and add the MyToken widget.",
             style = MaterialTheme.typography.bodySmall
