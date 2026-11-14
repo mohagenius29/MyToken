@@ -39,7 +39,33 @@ object SmsScanner {
                 if (save(dao, parsed)) added++
             }
         }
+        reconcile(dao)
         added
+    }
+
+    /**
+     * Token messages from some meters carry no amount. When a payment confirmation (M-Pesa, bank)
+     * for the same meter arrived within 24h, the token takes that payment's amount.
+     */
+    suspend fun reconcile(dao: AppDao) {
+        val all = dao.purchasesNow()
+        val payments = all.filter { it.kind == "PAYMENT" && it.amount > 0 }.toMutableList()
+        if (payments.isEmpty()) return
+        val day = 86_400_000L
+        val tokens = all.filter { it.kind != "PAYMENT" && it.amount <= 0 }
+        // Payments whose amount already matches a token are taken.
+        all.filter { it.kind != "PAYMENT" && it.amount > 0 }.forEach { t ->
+            payments.firstOrNull { kotlin.math.abs(it.amount - t.amount) <= 1.0 && kotlin.math.abs(it.dateMillis - t.dateMillis) <= day }
+                ?.let { payments.remove(it) }
+        }
+        for (t in tokens.sortedBy { it.dateMillis }) {
+            val match = payments
+                .filter { it.meterNumber == t.meterNumber || it.meterNumber == "UNKNOWN" || t.meterNumber == "UNKNOWN" }
+                .filter { kotlin.math.abs(it.dateMillis - t.dateMillis) <= day }
+                .minByOrNull { kotlin.math.abs(it.dateMillis - t.dateMillis) } ?: continue
+            dao.updatePurchase(t.copy(amount = match.amount))
+            payments.remove(match)
+        }
     }
 
     /** Lists the messages that look KPLC-related and how the app read each one. */
@@ -83,6 +109,15 @@ object SmsScanner {
                 kind = p.kind.name
             )
         )
+        if (id == -1L) {
+            // Already stored: a later, fuller read of the same message may fill in what was missed before.
+            val old = dao.purchaseByToken(p.token)
+            if (old != null) {
+                val amt = if (old.amount <= 0.0 && (p.amount ?: 0.0) > 0.0) p.amount!! else old.amount
+                val un = if (old.units <= 0.0 && (p.units ?: 0.0) > 0.0) p.units!! else old.units
+                if (amt != old.amount || un != old.units) dao.updatePurchase(old.copy(amount = amt, units = un))
+            }
+        }
         return id != -1L
     }
 }
@@ -99,7 +134,9 @@ class SmsReceiver : BroadcastReceiver() {
         CoroutineScope(Dispatchers.IO).launch {
             try {
                 val dao = AppDb.get(context).dao()
-                if (SmsScanner.save(dao, parsed)) {
+                val isNew = SmsScanner.save(dao, parsed)
+                SmsScanner.reconcile(dao)
+                if (isNew) {
                     if (parsed.kind == Kind.TOKEN) {
                         val units = parsed.units?.let { " (%.1f units)".format(it) } ?: ""
                         Notifier.post(context, 1001, "New KPLC token saved", "Meter ${parsed.meter ?: "unknown"}$units")

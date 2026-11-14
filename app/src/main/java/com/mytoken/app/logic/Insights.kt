@@ -41,7 +41,7 @@ object Insights {
         }
         payments.forEach { pay ->
             val dup = tokens.any { t ->
-                abs(t.amount - pay.amount) <= maxOf(1.0, pay.amount * 0.02) && abs(t.dateMillis - pay.dateMillis) <= DAY_MS
+                (t.amount <= 0.0 || abs(t.amount - pay.amount) <= maxOf(1.0, pay.amount * 0.02)) && abs(t.dateMillis - pay.dateMillis) <= DAY_MS
             }
             out.add(Eff(pay, if (ratio != null) pay.amount * ratio else 0.0, true, dup))
         }

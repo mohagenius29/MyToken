@@ -63,6 +63,9 @@ interface AppDao {
     @Query("SELECT * FROM readings ORDER BY atMillis")
     suspend fun readingsNow(): List<Reading>
 
+    @Query("SELECT * FROM purchases WHERE token = :t LIMIT 1")
+    suspend fun purchaseByToken(t: String): Purchase?
+
     @Insert(onConflict = OnConflictStrategy.IGNORE)
     suspend fun insertPurchase(p: Purchase): Long
 

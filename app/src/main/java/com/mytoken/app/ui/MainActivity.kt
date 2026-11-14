@@ -111,6 +111,7 @@ class MainVm(app: Application) : AndroidViewModel(app) {
                 val p = KplcParser.parse(chunk, null) ?: continue
                 if (SmsScanner.save(dao, p)) n++
             }
+            SmsScanner.reconcile(dao)
             message.value = if (n > 0) "Imported $n token(s)" else "No KPLC token found in that text"
             DaysWidget.refresh(ctx)
         }

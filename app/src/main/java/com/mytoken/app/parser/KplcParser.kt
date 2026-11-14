@@ -28,17 +28,62 @@ object KplcParser {
     private val acctLabelRe = Regex("""(?i)(?:acc(?:ount)?|a/c|acct)\s*(?:no\.?|number|num)?\s*[:#=\-]?\s*(?:is\s*)?(\d{6,13})""")
     private val longNumRe = Regex("""(?<!\d)\d{7,13}(?!\d)""")
     private val phoneRe = Regex("""^(0[17]\d{8}|254[17]\d{8})$""")
-    private val unitsRe1 = Regex("""(?i)units?\s*[:=\-]?\s*(\d+(?:\.\d+)?)""")
+    private val unitsRe1 = Regex("""(?i)units?(?:\s*purchased|\s*bought)?\s*(?:\(\s*kwh\s*\))?\s*[:=\-]?\s*(\d+(?:\.\d+)?)""")
     private val unitsRe2 = Regex("""(?i)(\d+(?:\.\d+)?)\s*(?:units?|kwh)\b""")
-    private val amtLabelRe = Regex("""(?i)(?<![a-z])(?:amt|amount|paid|total)\s*[:=]?\s*(?:ksh[s]?\.?|kes\.?)?\s*(\d[\d,]*(?:\.\d+)?)""")
-    private val currencyRe = Regex("""(?i)(?:ksh[s]?\.?|kes\.?)\s*(\d[\d,]*(?:\.\d+)?)""")
-    private val tknAmtRe = Regex("""(?i)tknamt\s*[:=]?\s*(?:ksh[s]?\.?|kes\.?)?\s*(\d[\d,]*(?:\.\d+)?)""")
+    // ---- Amount reading -------------------------------------------------------------------
+    private const val NUM = """(\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)"""
+    private const val CUR = """(?:k\.?\s?sh[s]?|kes|kenya\s+shillings?|shillings?|sh[s]?)"""
+    private const val NOT_UNITS = """(?!\d)(?!\s*(?:units?|kwh)\b)"""
+    // Gap between a label and its number: optional ":" "=" "-" ".", brackets, a currency word.
+    private const val GAP = """\s*(?:\(\s*$CUR\s*\))?\s*[:=\-\u2013]?\s*(?:$CUR\s*[.:\-]?)?\s*"""
+
+    /** "Total Paid", "Amount Paid", "Amt Paid", "Paid Amount", "Total Amount" - what the customer actually spent. */
+    private val paidLabelRe = Regex("""(?i)(?<![a-z])(?:(?:total|gross)\s*(?:amount|amt)\s*(?:paid)?|(?:amount|amt)\s*paid|paid\s*(?:amount|amt)|total\s*paid|total|amount\s*tendered|paid)$GAP$NUM$NOT_UNITS""")
+    /** Plain "Amt:", "Amount:", "Cost:" - but not "Token Amt" / "Tkn Amt", which is the smaller value after fees. */
+    private val amtLabelRe = Regex("""(?i)(?<![a-z])(?<!tkn\s)(?<!token\s)(?<!tknamt)(?:amt|amount|cost|purchase|bought)$GAP$NUM$NOT_UNITS""")
+    private val currencyPrefixRe = Regex("""(?i)(?<![a-z])$CUR\s*[.:\-]?\s*$NUM(?!\d)""")
+    private val currencySuffixRe = Regex("""(?i)(?<![\d.,])$NUM\s*(?:/=|/-|$CUR(?![a-z]))""")
+    private val tknAmtRe = Regex("""(?i)(?:tkn|token)\s*(?:amt|amount|value)$GAP$NUM$NOT_UNITS""")
+    private val skipBeforeRe = Regex("""(?i)(?:balance|bal|cost|fee|fees|charge|charges|limit|commission|levy|vat|tax|rate)\W{0,6}(?:is|of|was|:)?\W{0,3}$""")
     private val dateRe = Regex("""(?i)date\s*[:=]?\s*(\d{4})[-/]?(\d{2})[-/]?(\d{2})""")
     private val refRe = Regex("""^\s*([A-Z0-9]{10})\s+(?i:confirmed)""")
 
     private val relevantWords = listOf("kplc", "kenya power", "kenyapower", "token", "units", "888880", "prepaid", "mtr", "meter", "kwh")
 
-    private fun norm(s: String) = s.replace(Regex("\\s+"), " ").trim()
+    private val oddSpaceRe = Regex("[\\u00A0\\u1680\\u2000-\\u200D\\u202F\\u205F\\u3000\\uFEFF]")
+    private val spaceRe = Regex("\\s+")
+
+    /** Collapses every kind of space (including non-breaking ones banks and SMS apps like to insert). */
+    private fun norm(s: String) = s.replace(oddSpaceRe, " ").replace(spaceRe, " ").trim()
+
+    private fun toAmount(raw: String?): Double? {
+        val v = raw?.replace(",", "")?.toDoubleOrNull() ?: return null
+        return if (v > 0 && v < 10_000_000) v else null
+    }
+
+    private fun firstAmount(re: Regex, text: String, skipFees: Boolean = false, group: Int = 1): Double? {
+        for (m in re.findAll(text)) {
+            if (skipFees) {
+                val before = text.substring(maxOf(0, m.range.first - 28), m.range.first)
+                if (skipBeforeRe.containsMatchIn(before)) continue
+            }
+            val a = toAmount(m.groupValues[group])
+            if (a != null) return a
+        }
+        return null
+    }
+
+    /**
+     * Amount spent on the purchase. Order: explicit "total paid" style label, plain "Amt/Amount",
+     * any currency-prefixed number (Ksh 500, KES500, Ksh.500, Ksh:500), a number followed by a
+     * currency (500 KES, 500/=), and last the token value ("Token Amt") when nothing else is there.
+     */
+    fun findAmount(text: String): Double? =
+        firstAmount(paidLabelRe, text, skipFees = true)
+            ?: firstAmount(amtLabelRe, text, skipFees = true)
+            ?: firstAmount(currencyPrefixRe, text, skipFees = true)
+            ?: firstAmount(currencySuffixRe, text, skipFees = true)
+            ?: firstAmount(tknAmtRe, text)
 
     fun looksRelevant(body: String): Boolean {
         val l = body.lowercase()
@@ -64,10 +109,7 @@ object KplcParser {
 
         val units = unitsRe1.find(rest)?.groupValues?.get(1)?.toDoubleOrNull()
             ?: unitsRe2.find(rest)?.groupValues?.get(1)?.toDoubleOrNull()
-        val amtStr = amtLabelRe.find(rest)?.groupValues?.get(1)
-            ?: currencyRe.find(rest)?.groupValues?.get(1)
-            ?: tknAmtRe.find(rest)?.groupValues?.get(1)
-        val amount = amtStr?.replace(",", "")?.toDoubleOrNull()
+        val amount = findAmount(rest)
         return Fields(meter, token, units, amount)
     }
 
