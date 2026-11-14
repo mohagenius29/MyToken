@@ -41,6 +41,11 @@ class DaysWidget : AppWidgetProvider() {
                     val rv = RemoteViews(ctx.packageName, R.layout.widget_days)
                     rv.setTextViewText(R.id.w_days, ins?.daysLeft?.let { "%.0f".format(it) } ?: "--")
                     rv.setTextViewText(R.id.w_sub, if (meter == null) "Open app to set up" else "days left - ${meter.display()}")
+                    rv.setTextViewText(
+                        R.id.w_run,
+                        if (ins?.daysRunning != null) "Ran %.1f d".format(ins.daysRunning) +
+                            (ins.totalDays?.let { " - total %.1f d".format(it) } ?: "") else ""
+                    )
                     val pi = PendingIntent.getActivity(ctx, 0, Intent(ctx, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
                     rv.setOnClickPendingIntent(R.id.w_root, pi)
                     ids.forEach { mgr.updateAppWidget(it, rv) }

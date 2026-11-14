@@ -547,6 +547,12 @@ fun InsightCard(ins: Insight, m: Meter, last: Reading?, onBalance: () -> Unit, o
                     style = MaterialTheme.typography.bodySmall
                 )
             }
+            ins.daysRunning?.let { run ->
+                val lastTxt = if (ins.lastUnits != null && ins.lastUnits > 0 && ins.lastBoughtAt != null)
+                    " (last token: %.1f units, bought %s)".format(ins.lastUnits, fmtDate(ins.lastBoughtAt)) else ""
+                Text("Current token has run for %.1f days%s".format(run, lastTxt), fontWeight = FontWeight.Medium)
+            }
+            ins.totalDays?.let { Text("Expected to last %.1f days in total (ran + left)".format(it), fontWeight = FontWeight.Medium) }
             ins.remainingUnits?.let { Text("Estimated units left: %.1f".format(it)) }
             ins.dailyUnits?.let { Text("Average use: %.1f units/day".format(it)) }
             ins.avgPrice?.let { Text("Average price: KES %.2f per unit".format(it)) }

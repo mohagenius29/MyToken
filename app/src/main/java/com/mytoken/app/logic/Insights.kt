@@ -16,7 +16,13 @@ data class Insight(
     val totalSpend: Double,
     val avgPrice: Double?,
     val basis: String,
-    val estimatedCount: Int
+    val estimatedCount: Int,
+    /** Days since the latest purchase (how long the current token has already been running). */
+    val daysRunning: Double? = null,
+    /** daysRunning + daysLeft: how long the current token is expected to last in total. */
+    val totalDays: Double? = null,
+    val lastUnits: Double? = null,
+    val lastBoughtAt: Long? = null
 )
 
 object Insights {
@@ -109,6 +115,12 @@ object Insights {
         }
         remaining = remaining?.coerceAtLeast(0.0)
         val daysLeft = if (remaining != null && daily != null && daily > 0) remaining / daily else null
-        return Insight(daily, remaining, daysLeft, totalUnits, spend, avgPrice, basis, effs.count { it.estimated })
+        val lastBuy = effs.lastOrNull { it.p.dateMillis <= now } ?: effs.lastOrNull()
+        val running = lastBuy?.let { ((now - it.p.dateMillis) / DAY).coerceAtLeast(0.0) }
+        val total = if (running != null && daysLeft != null) running + daysLeft else null
+        return Insight(
+            daily, remaining, daysLeft, totalUnits, spend, avgPrice, basis, effs.count { it.estimated },
+            running, total, lastBuy?.units, lastBuy?.p?.dateMillis
+        )
     }
 }
