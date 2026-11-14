@@ -53,15 +53,20 @@ object Notifier {
 class ReminderWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx, params) {
     override suspend fun doWork(): Result {
         val ctx = applicationContext
+        val found = try { com.mytoken.app.sms.SmsScanner.scan(ctx) } catch (e: Exception) { 0 }
+        if (found > 0) Notifier.post(ctx, 1003, "New KPLC message(s) saved", "$found new record(s) added to MyToken")
+
         val dao = AppDb.get(ctx).dao()
         val meters = dao.metersNow().filter { it.tracked }
         val all = dao.purchasesNow()
         val allReadings = dao.readingsNow()
         val threshold = Prefs.threshold(ctx)
+        val now = System.currentTimeMillis()
         for (m in meters) {
             val ins = Insights.compute(m, all.filter { it.meterNumber == m.number }, allReadings.filter { it.meterNumber == m.number })
             val d = ins.daysLeft
-            if (d != null && d <= threshold) {
+            if (d != null && d <= threshold && now - Prefs.lastLow(ctx, m.number) > 20L * 3_600_000L) {
+                Prefs.setLastLow(ctx, m.number, now)
                 Notifier.post(
                     ctx, m.number.hashCode(),
                     "Low tokens: ${m.display()}",
@@ -75,9 +80,9 @@ class ReminderWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(c
 
     companion object {
         fun schedule(ctx: Context) {
-            val req = PeriodicWorkRequestBuilder<ReminderWorker>(12, TimeUnit.HOURS).build()
+            val req = PeriodicWorkRequestBuilder<ReminderWorker>(15, TimeUnit.MINUTES).build()
             WorkManager.getInstance(ctx)
-                .enqueueUniquePeriodicWork("reminder", ExistingPeriodicWorkPolicy.KEEP, req)
+                .enqueueUniquePeriodicWork("reminder", ExistingPeriodicWorkPolicy.UPDATE, req)
         }
     }
 }

@@ -116,6 +116,27 @@ class MainVm(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    fun autoScan() {
+        viewModelScope.launch {
+            val n = try { SmsScanner.scan(ctx) } catch (e: Exception) { 0 }
+            if (n > 0) {
+                message.value = "Found $n new message(s)"
+                DaysWidget.refresh(ctx)
+            }
+        }
+    }
+
+    fun mergeMeter(from: String, to: String) {
+        viewModelScope.launch {
+            dao.movePurchases(from, to)
+            dao.moveReadings(from, to)
+            dao.deleteMeter(from)
+            if (selected.value == from) select(to)
+            message.value = "Moved to $to"
+            DaysWidget.refresh(ctx)
+        }
+    }
+
     fun setTracked(number: String, v: Boolean) {
         viewModelScope.launch {
             val m = dao.metersNow().firstOrNull { it.number == number } ?: return@launch
@@ -231,6 +252,11 @@ class MainVm(app: Application) : AndroidViewModel(app) {
 class MainActivity : ComponentActivity() {
     private val vm: MainVm by viewModels()
 
+    override fun onResume() {
+        super.onResume()
+        vm.autoScan()
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         ReminderWorker.schedule(this)
@@ -282,7 +308,7 @@ fun App(vm: MainVm) {
 
     Scaffold(
         snackbarHost = { SnackbarHost(snack) },
-        topBar = { TopAppBar(title = { Text("MyToken", fontWeight = FontWeight.Bold) }) },
+        topBar = { TopAppBar(title = { Text("MyToken", fontWeight = FontWeight.Bold) }, actions = { TextButton(onClick = askAndScan) { Text("Refresh") } }) },
         bottomBar = {
             if (tracked.isNotEmpty()) {
                 NavigationBar {
@@ -424,6 +450,7 @@ fun Home(vm: MainVm, tracked: List<Meter>, selectedNum: String?, purchases: List
     val ins = remember(m, mine, myReadings) { Insights.compute(m, mine, myReadings) }
     val effs = remember(mine) { Insights.effective(mine).filter { !it.duplicate }.sortedByDescending { it.p.dateMillis } }
     var balDialog by remember { mutableStateOf(false) }
+    val unknownCount = purchases.count { it.meterNumber == "UNKNOWN" }
     val clip = LocalClipboardManager.current
 
     LazyColumn(
@@ -444,6 +471,16 @@ fun Home(vm: MainVm, tracked: List<Meter>, selectedNum: String?, purchases: List
             }
         }
         item { InsightCard(ins, m, myReadings.lastOrNull(), { balDialog = true }, { vm.undoLastReading(m.number) }) }
+        if (unknownCount > 0 && m.number != "UNKNOWN") {
+            item {
+                Card(Modifier.fillMaxWidth(), colors = CardDefaults.cardColors(containerColor = Color(0xFFFFF8E1))) {
+                    Column(Modifier.padding(12.dp)) {
+                        Text("$unknownCount message(s) had no meter number.")
+                        TextButton(onClick = { vm.mergeMeter("UNKNOWN", m.number) }) { Text("Add them to ${m.display()}") }
+                    }
+                }
+            }
+        }
         item { Text("Purchases", style = MaterialTheme.typography.titleMedium) }
         if (effs.isEmpty()) item { Text("No tokens for this meter yet.") }
         items(effs, key = { it.p.id }) { e ->
@@ -585,6 +622,7 @@ fun BarBlock(title: String, data: List<Pair<String, Double>>, color: Color) {
 @Composable
 fun MetersTab(vm: MainVm, meters: List<Meter>, purchases: List<Purchase>, readings: List<Reading>, onScan: () -> Unit) {
     var renaming by remember { mutableStateOf<Meter?>(null) }
+    var merging by remember { mutableStateOf<Meter?>(null) }
     LazyColumn(contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
         item {
             Text(
@@ -606,11 +644,33 @@ fun MetersTab(vm: MainVm, meters: List<Meter>, purchases: List<Purchase>, readin
                             style = MaterialTheme.typography.bodySmall
                         )
                     }
-                    TextButton(onClick = { renaming = m }) { Text("Rename") }
+                    Column {
+                        TextButton(onClick = { renaming = m }) { Text("Rename") }
+                        if (meters.size > 1) TextButton(onClick = { merging = m }) { Text("Merge") }
+                    }
                 }
             }
         }
         item { OutlinedButton(onClick = onScan, modifier = Modifier.fillMaxWidth()) { Text("Rescan messages") } }
+    }
+    merging?.let { from ->
+        AlertDialog(
+            onDismissRequest = { merging = null },
+            title = { Text("Move ${from.display()} into which meter?") },
+            text = {
+                Column {
+                    Text("All its tokens and balances are moved, then this entry is removed.", style = MaterialTheme.typography.bodySmall)
+                    meters.filter { it.number != from.number }.forEach { other ->
+                        TextButton(onClick = {
+                            vm.mergeMeter(from.number, other.number)
+                            merging = null
+                        }) { Text(other.display()) }
+                    }
+                }
+            },
+            confirmButton = {},
+            dismissButton = { TextButton(onClick = { merging = null }) { Text("Cancel") } }
+        )
     }
     renaming?.let { m ->
         TextDialog(
@@ -639,6 +699,12 @@ fun ReviewScreen(vm: MainVm, list: List<ReviewItem>, onAdd: (Fields) -> Unit) {
             Text(
                 "Green: understood and saved. Red: looks like KPLC but was not recognised. For red ones tap Add manually (fields are pre-filled) or Copy the text and send it to the developer.",
                 style = MaterialTheme.typography.bodySmall
+            )
+        }
+        item {
+            Text(
+                "${list.count { it.kind == "TOKEN" }} token message(s), ${list.count { it.kind == "PAYMENT" }} payment(s), ${list.count { it.kind == null }} not recognised",
+                fontWeight = FontWeight.Bold
             )
         }
         if (list.isEmpty()) item { Text("No KPLC-looking messages found in your inbox.") }

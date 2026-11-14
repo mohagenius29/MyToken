@@ -15,7 +15,7 @@ data class Meter(
     val balanceAt: Long? = null
 )
 
-fun Meter.display(): String = label.ifBlank { number }
+fun Meter.display(): String = label.ifBlank { if (number == "UNKNOWN") "Unknown meter" else number }
 
 @Entity(
     tableName = "purchases",
@@ -84,6 +84,15 @@ interface AppDao {
     @Delete
     suspend fun deleteReading(r: Reading)
 
+    @Query("UPDATE purchases SET meterNumber = :to WHERE meterNumber = :from")
+    suspend fun movePurchases(from: String, to: String)
+
+    @Query("UPDATE readings SET meterNumber = :to WHERE meterNumber = :from")
+    suspend fun moveReadings(from: String, to: String)
+
+    @Query("DELETE FROM meters WHERE number = :n")
+    suspend fun deleteMeter(n: String)
+
     @Query("DELETE FROM purchases")
     suspend fun clearPurchases()
 
@@ -121,6 +130,8 @@ object Prefs {
     private fun sp(c: Context) = c.getSharedPreferences("mytoken", Context.MODE_PRIVATE)
     fun threshold(c: Context): Int = sp(c).getInt("threshold", 3)
     fun setThreshold(c: Context, v: Int) = sp(c).edit().putInt("threshold", v).apply()
+    fun lastLow(c: Context, n: String): Long = sp(c).getLong("low_$n", 0L)
+    fun setLastLow(c: Context, n: String, t: Long) = sp(c).edit().putLong("low_$n", t).apply()
     fun selectedMeter(c: Context): String? = sp(c).getString("selected", null)
     fun setSelectedMeter(c: Context, v: String) = sp(c).edit().putString("selected", v).apply()
 }

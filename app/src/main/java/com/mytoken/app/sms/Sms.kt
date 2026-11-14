@@ -51,7 +51,7 @@ object SmsScanner {
             null, null, "date DESC"
         ) ?: return@withContext out
         cursor.use { c ->
-            while (c.moveToNext() && out.size < 150) {
+            while (c.moveToNext() && out.size < 400) {
                 val body = c.getString(0) ?: continue
                 if (!KplcParser.looksRelevant(body)) continue
                 val date = c.getLong(1)
@@ -63,7 +63,15 @@ object SmsScanner {
     }
 
     suspend fun save(dao: AppDao, p: ParsedToken): Boolean {
-        val meter = p.meter ?: "UNKNOWN"
+        val meter: String = p.meter ?: run {
+            val real = dao.metersNow().filter { it.number != "UNKNOWN" }
+            val tracked = real.filter { it.tracked }
+            when {
+                tracked.size == 1 -> tracked[0].number
+                real.size == 1 -> real[0].number
+                else -> "UNKNOWN"
+            }
+        }
         dao.insertMeter(Meter(number = meter))
         val id = dao.insertPurchase(
             Purchase(

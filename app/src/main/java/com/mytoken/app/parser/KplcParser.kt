@@ -23,8 +23,9 @@ data class ParsedToken(
  *  - payment confirmations to KPLC (M-Pesa, Equity, other banks) that carry no token
  */
 object KplcParser {
-    private val tokenRe = Regex("""(?<!\d)\d{4}(?:[\s.\-]?\d{4}){4}(?!\d)""")
-    private val labelledNumRe = Regex("""(?i)(?:mtr|meter|acc(?:ount)?|a/c|acct)\s*(?:no\.?|number|num)?\s*[:#=\-]?\s*(?:is\s*)?(\d{6,13})""")
+    private val tokenRe = Regex("""(?<!\d)\d{4}(?:[\s.\-\u2010-\u2015_/,:]{0,2}\d{4}){4}(?!\d)""")
+    private val meterLabelRe = Regex("""(?i)(?:mtr|meter)\s*(?:no\.?|number|num)?\s*[:#=\-]?\s*(?:is\s*)?(\d{6,13})""")
+    private val acctLabelRe = Regex("""(?i)(?:acc(?:ount)?|a/c|acct)\s*(?:no\.?|number|num)?\s*[:#=\-]?\s*(?:is\s*)?(\d{6,13})""")
     private val longNumRe = Regex("""(?<!\d)\d{7,13}(?!\d)""")
     private val phoneRe = Regex("""^(0[17]\d{8}|254[17]\d{8})$""")
     private val unitsRe1 = Regex("""(?i)units?\s*[:=\-]?\s*(\d+(?:\.\d+)?)""")
@@ -50,12 +51,16 @@ object KplcParser {
         val token = tokenMatch?.value?.filter { it.isDigit() }
         val rest = if (tokenMatch != null) text.replace(tokenRe, " ") else text
 
-        val candidates = mutableListOf<String>()
-        labelledNumRe.findAll(rest).forEach { candidates.add(it.groupValues[1]) }
-        longNumRe.findAll(rest).forEach { candidates.add(it.value) }
-        val usable = candidates.filter { !phoneRe.matches(it) }
-        val meter = usable.firstOrNull { it.length == 11 }
-            ?: usable.firstOrNull { it.length in 7..12 }
+        // Meter priority: "Mtr/Meter" label, then an 11-digit "account" label, then any 11-digit number,
+        // then other plausible account-like numbers. Phone numbers are never used.
+        val byMeterLabel = meterLabelRe.findAll(rest).map { it.groupValues[1] }.filter { !phoneRe.matches(it) }.toList()
+        val byAcctLabel = acctLabelRe.findAll(rest).map { it.groupValues[1] }.filter { !phoneRe.matches(it) }.toList()
+        val unlabelled = longNumRe.findAll(rest).map { it.value }.filter { !phoneRe.matches(it) }.toList()
+        val meter = byMeterLabel.firstOrNull()
+            ?: byAcctLabel.firstOrNull { it.length == 11 }
+            ?: unlabelled.firstOrNull { it.length == 11 }
+            ?: byAcctLabel.firstOrNull { it.length in 7..12 }
+            ?: unlabelled.firstOrNull { it.length in 7..12 }
 
         val units = unitsRe1.find(rest)?.groupValues?.get(1)?.toDoubleOrNull()
             ?: unitsRe2.find(rest)?.groupValues?.get(1)?.toDoubleOrNull()
@@ -73,7 +78,6 @@ object KplcParser {
         val date = smsMillis ?: parseDate(text) ?: System.currentTimeMillis()
 
         if (f.token != null) {
-            if (relevantWords.none { it in lower }) return null
             return ParsedToken(Kind.TOKEN, f.meter, f.token, f.units, f.amount, date)
         }
 
