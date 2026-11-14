@@ -39,6 +39,9 @@ import com.mytoken.app.data.AppDb
 import com.mytoken.app.data.Meter
 import com.mytoken.app.data.Prefs
 import com.mytoken.app.data.Purchase
+import com.mytoken.app.data.Reading
+import com.mytoken.app.parser.Fields
+import com.mytoken.app.sms.ReviewItem
 import com.mytoken.app.data.display
 import com.mytoken.app.export.Exporter
 import com.mytoken.app.logic.Insight
@@ -64,6 +67,8 @@ class MainVm(app: Application) : AndroidViewModel(app) {
 
     val meters = dao.meters().stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
     val purchases = dao.purchases().stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
+    val readings = dao.readings().stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
+    val review = MutableStateFlow<List<ReviewItem>?>(null)
     val selected = MutableStateFlow(Prefs.selectedMeter(app))
     val threshold = MutableStateFlow(Prefs.threshold(app))
     val message = MutableStateFlow<String?>(null)
@@ -129,10 +134,31 @@ class MainVm(app: Application) : AndroidViewModel(app) {
 
     fun saveBalance(number: String, units: Double) {
         viewModelScope.launch {
-            val m = dao.metersNow().firstOrNull { it.number == number } ?: return@launch
-            dao.updateMeter(m.copy(balanceUnits = units, balanceAt = System.currentTimeMillis()))
+            dao.insertReading(Reading(meterNumber = number, units = units, atMillis = System.currentTimeMillis()))
             message.value = "Balance saved"
             DaysWidget.refresh(ctx)
+        }
+    }
+
+    fun undoLastReading(number: String) {
+        viewModelScope.launch {
+            val r = dao.readingsNow().filter { it.meterNumber == number }.maxByOrNull { it.atMillis } ?: return@launch
+            dao.deleteReading(r)
+            DaysWidget.refresh(ctx)
+        }
+    }
+
+    fun loadReview() {
+        viewModelScope.launch {
+            review.value = try {
+                SmsScanner.review(ctx)
+            } catch (e: SecurityException) {
+                message.value = "Allow SMS permission first (tap Scan)"
+                null
+            } catch (e: Exception) {
+                message.value = "Could not read messages"
+                null
+            }
         }
     }
 
@@ -175,7 +201,7 @@ class MainVm(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             val ok = withContext(Dispatchers.IO) {
                 try {
-                    val json = Exporter.backupJson(dao.metersNow(), dao.purchasesNow())
+                    val json = Exporter.backupJson(dao.metersNow(), dao.purchasesNow(), dao.readingsNow())
                     ctx.contentResolver.openOutputStream(uri)?.use { it.write(json.toByteArray()) }
                     true
                 } catch (e: Exception) {
@@ -226,6 +252,8 @@ fun App(vm: MainVm) {
     val ctx = LocalContext.current
     val meters by vm.meters.collectAsState()
     val purchases by vm.purchases.collectAsState()
+    val readings by vm.readings.collectAsState()
+    val review by vm.review.collectAsState()
     val selected by vm.selected.collectAsState()
     val message by vm.message.collectAsState()
     val snack = remember { SnackbarHostState() }
@@ -248,6 +276,7 @@ fun App(vm: MainVm) {
     }
 
     var showAdd by remember { mutableStateOf(false) }
+    var prefill by remember { mutableStateOf<Fields?>(null) }
     var tab by remember { mutableIntStateOf(0) }
     val tracked = meters.filter { it.tracked }
 
@@ -275,13 +304,16 @@ fun App(vm: MainVm) {
         }
     ) { pad ->
         Box(Modifier.padding(pad)) {
-            if (tracked.isEmpty()) {
+            val rv = review
+            if (rv != null) {
+                ReviewScreen(vm, rv) { f -> prefill = f; showAdd = true }
+            } else if (tracked.isEmpty()) {
                 Setup(meters, purchases, askAndScan, { showAdd = true }, { showPaste = true }, vm::setTracked)
             } else when (tab) {
-                0 -> Home(vm, tracked, selected, purchases)
+                0 -> Home(vm, tracked, selected, purchases, readings)
                 1 -> Charts(vm, tracked, selected, purchases)
-                2 -> MetersTab(vm, meters, purchases, askAndScan)
-                else -> MoreTab(vm, askAndScan) { showPaste = true }
+                2 -> MetersTab(vm, meters, purchases, readings, askAndScan)
+                else -> MoreTab(vm, askAndScan, { showPaste = true }, { vm.loadReview() })
             }
         }
     }
@@ -328,12 +360,17 @@ fun App(vm: MainVm) {
     }
 
     if (showAdd) {
+        val pf = prefill
         ManualAddDialog(
-            defaultMeter = selected ?: tracked.firstOrNull()?.number ?: "",
-            onDismiss = { showAdd = false },
+            defaultMeter = pf?.meter ?: selected ?: tracked.firstOrNull()?.number ?: "",
+            initialToken = pf?.token ?: "",
+            initialUnits = pf?.units?.toString() ?: "",
+            initialAmount = pf?.amount?.toString() ?: "",
+            onDismiss = { showAdd = false; prefill = null },
             onSave = { m, t, u, a ->
                 vm.addManual(m, t, u, a)
                 showAdd = false
+                prefill = null
             }
         )
     }
@@ -380,10 +417,12 @@ fun Setup(
 }
 
 @Composable
-fun Home(vm: MainVm, tracked: List<Meter>, selectedNum: String?, purchases: List<Purchase>) {
+fun Home(vm: MainVm, tracked: List<Meter>, selectedNum: String?, purchases: List<Purchase>, readings: List<Reading>) {
     val m = tracked.firstOrNull { it.number == selectedNum } ?: tracked.first()
     val mine = purchases.filter { it.meterNumber == m.number }
-    val ins = remember(m, mine) { Insights.compute(m, mine) }
+    val myReadings = readings.filter { it.meterNumber == m.number }
+    val ins = remember(m, mine, myReadings) { Insights.compute(m, mine, myReadings) }
+    val effs = remember(mine) { Insights.effective(mine).filter { !it.duplicate }.sortedByDescending { it.p.dateMillis } }
     var balDialog by remember { mutableStateOf(false) }
     val clip = LocalClipboardManager.current
 
@@ -404,26 +443,35 @@ fun Home(vm: MainVm, tracked: List<Meter>, selectedNum: String?, purchases: List
                 }
             }
         }
-        item { InsightCard(ins, m) { balDialog = true } }
+        item { InsightCard(ins, m, myReadings.lastOrNull(), { balDialog = true }, { vm.undoLastReading(m.number) }) }
         item { Text("Purchases", style = MaterialTheme.typography.titleMedium) }
-        if (mine.isEmpty()) item { Text("No tokens for this meter yet.") }
-        items(mine, key = { it.id }) { p ->
+        if (effs.isEmpty()) item { Text("No tokens for this meter yet.") }
+        items(effs, key = { it.p.id }) { e ->
+            val p = e.p
             Card(Modifier.fillMaxWidth()) {
                 Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                         Text(fmtDate(p.dateMillis), fontWeight = FontWeight.Bold)
                         Text(money(p.amount))
                     }
-                    val per = if (p.units > 0) "  -  KES %.2f/unit".format(p.amount / p.units) else ""
-                    Text("%.2f units$per".format(p.units), style = MaterialTheme.typography.bodyMedium)
-                    Text(prettyToken(p.token), fontFamily = FontFamily.Monospace, fontSize = 15.sp)
+                    if (p.kind == "PAYMENT") {
+                        Text("Payment message - no token message found", style = MaterialTheme.typography.bodySmall)
+                        Text("About %.1f units (estimated)".format(e.units))
+                    } else {
+                        val per = if (e.units > 0 && p.amount > 0) "  -  KES %.2f/unit".format(p.amount / e.units) else ""
+                        val est = if (e.estimated) " (estimated)" else ""
+                        Text("%.2f units".format(e.units) + est + per, style = MaterialTheme.typography.bodyMedium)
+                        Text(prettyToken(p.token), fontFamily = FontFamily.Monospace, fontSize = 15.sp)
+                    }
                     Row(verticalAlignment = Alignment.CenterVertically) {
-                        TextButton(onClick = {
-                            clip.setText(AnnotatedString(p.token))
-                            vm.message.value = "Token copied"
-                        }) { Text("Copy") }
-                        Checkbox(checked = p.used, onCheckedChange = { vm.toggleUsed(p) })
-                        Text("Used")
+                        if (p.kind != "PAYMENT") {
+                            TextButton(onClick = {
+                                clip.setText(AnnotatedString(p.token))
+                                vm.message.value = "Token copied"
+                            }) { Text("Copy") }
+                            Checkbox(checked = p.used, onCheckedChange = { vm.toggleUsed(p) })
+                            Text("Used")
+                        }
                         Spacer(Modifier.weight(1f))
                         TextButton(onClick = { vm.delete(p) }) { Text("Delete") }
                     }
@@ -435,7 +483,7 @@ fun Home(vm: MainVm, tracked: List<Meter>, selectedNum: String?, purchases: List
     if (balDialog) {
         TextDialog(
             title = "Current meter balance",
-            label = "Units left on the meter",
+            label = "Units now showing on your meter",
             initial = "",
             numeric = true,
             onDismiss = { balDialog = false },
@@ -448,7 +496,7 @@ fun Home(vm: MainVm, tracked: List<Meter>, selectedNum: String?, purchases: List
 }
 
 @Composable
-fun InsightCard(ins: Insight, m: Meter, onBalance: () -> Unit) {
+fun InsightCard(ins: Insight, m: Meter, last: Reading?, onBalance: () -> Unit, onUndo: () -> Unit) {
     Card(Modifier.fillMaxWidth(), colors = CardDefaults.cardColors(containerColor = Color(0xFFE8F5E9))) {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
             Text(m.display(), style = MaterialTheme.typography.labelLarge)
@@ -456,14 +504,27 @@ fun InsightCard(ins: Insight, m: Meter, onBalance: () -> Unit) {
                 Text("About %.1f days left".format(ins.daysLeft), style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
             } else {
                 Text("Not enough data yet", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
-                Text("Save at least two purchases (or update your balance) to get a forecast.", style = MaterialTheme.typography.bodySmall)
+                Text(
+                    "Tap Update my balance and type the units now showing on your meter. Do it again in a few days and I will learn how fast you use units.",
+                    style = MaterialTheme.typography.bodySmall
+                )
             }
             ins.remainingUnits?.let { Text("Estimated units left: %.1f".format(it)) }
             ins.dailyUnits?.let { Text("Average use: %.1f units/day".format(it)) }
             ins.avgPrice?.let { Text("Average price: KES %.2f per unit".format(it)) }
             Text("Total bought: %.1f units for %s".format(ins.totalUnits, money(ins.totalSpend)))
-            m.balanceUnits?.let { b -> m.balanceAt?.let { t -> Text("Last balance: %.1f units on %s".format(b, fmtDate(t)), style = MaterialTheme.typography.bodySmall) } }
-            TextButton(onClick = onBalance) { Text("Update my balance") }
+            Text("Forecast based on: ${ins.basis}", style = MaterialTheme.typography.bodySmall)
+            if (ins.estimatedCount > 0) {
+                Text(
+                    "${ins.estimatedCount} purchase(s) have estimated units (payment seen, token message not read).",
+                    style = MaterialTheme.typography.bodySmall
+                )
+            }
+            last?.let { Text("Last balance: %.1f units on %s".format(it.units, fmtDate(it.atMillis)), style = MaterialTheme.typography.bodySmall) }
+            Row {
+                TextButton(onClick = onBalance) { Text("Update my balance") }
+                if (last != null) TextButton(onClick = onUndo) { Text("Undo last") }
+            }
         }
     }
 }
@@ -472,9 +533,10 @@ fun InsightCard(ins: Insight, m: Meter, onBalance: () -> Unit) {
 fun Charts(vm: MainVm, tracked: List<Meter>, selectedNum: String?, purchases: List<Purchase>) {
     val m = tracked.firstOrNull { it.number == selectedNum } ?: tracked.first()
     val mine = purchases.filter { it.meterNumber == m.number }
+    val effs = Insights.effective(mine).filter { !it.duplicate }
     val keyFmt = SimpleDateFormat("yyyyMM", Locale.US)
     val labelFmt = SimpleDateFormat("MMM yy", Locale.getDefault())
-    val groups = mine.groupBy { keyFmt.format(Date(it.dateMillis)) }.toSortedMap().entries.toList().takeLast(6)
+    val groups = effs.groupBy { keyFmt.format(Date(it.p.dateMillis)) }.toSortedMap().entries.toList().takeLast(6)
 
     Column(Modifier.padding(16.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(14.dp)) {
         if (tracked.size > 1) {
@@ -487,8 +549,8 @@ fun Charts(vm: MainVm, tracked: List<Meter>, selectedNum: String?, purchases: Li
         if (groups.isEmpty()) {
             Text("No purchases yet. Charts will appear after your first token.")
         } else {
-            BarBlock("Monthly spend (KES)", groups.map { labelFmt.format(Date(it.value.first().dateMillis)) to it.value.sumOf { p -> p.amount } }, Color(0xFF2E7D32))
-            BarBlock("Monthly units bought", groups.map { labelFmt.format(Date(it.value.first().dateMillis)) to it.value.sumOf { p -> p.units } }, Color(0xFFF9A825))
+            BarBlock("Monthly spend (KES)", groups.map { g -> labelFmt.format(Date(g.value.first().p.dateMillis)) to g.value.sumOf { e -> e.p.amount } }, Color(0xFF2E7D32))
+            BarBlock("Monthly units bought", groups.map { g -> labelFmt.format(Date(g.value.first().p.dateMillis)) to g.value.sumOf { e -> e.units } }, Color(0xFFF9A825))
         }
     }
 }
@@ -521,7 +583,7 @@ fun BarBlock(title: String, data: List<Pair<String, Double>>, color: Color) {
 }
 
 @Composable
-fun MetersTab(vm: MainVm, meters: List<Meter>, purchases: List<Purchase>, onScan: () -> Unit) {
+fun MetersTab(vm: MainVm, meters: List<Meter>, purchases: List<Purchase>, readings: List<Reading>, onScan: () -> Unit) {
     var renaming by remember { mutableStateOf<Meter?>(null) }
     LazyColumn(contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
         item {
@@ -532,6 +594,7 @@ fun MetersTab(vm: MainVm, meters: List<Meter>, purchases: List<Purchase>, onScan
         }
         items(meters, key = { it.number }) { m ->
             val mine = purchases.filter { it.meterNumber == m.number }
+            val ins = Insights.compute(m, mine, readings.filter { it.meterNumber == m.number })
             Card(Modifier.fillMaxWidth()) {
                 Row(Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
                     Checkbox(checked = m.tracked, onCheckedChange = { vm.setTracked(m.number, it) })
@@ -539,7 +602,7 @@ fun MetersTab(vm: MainVm, meters: List<Meter>, purchases: List<Purchase>, onScan
                         Text(m.display(), fontWeight = FontWeight.Bold)
                         if (m.label.isNotBlank()) Text(m.number, style = MaterialTheme.typography.bodySmall)
                         Text(
-                            "${mine.size} token(s) - %.1f units - %s".format(mine.sumOf { it.units }, money(mine.sumOf { it.amount })),
+                            "${mine.size} record(s) - %.1f units - %s".format(ins.totalUnits, money(ins.totalSpend)),
                             style = MaterialTheme.typography.bodySmall
                         )
                     }
@@ -565,7 +628,49 @@ fun MetersTab(vm: MainVm, meters: List<Meter>, purchases: List<Purchase>, onScan
 }
 
 @Composable
-fun MoreTab(vm: MainVm, onScan: () -> Unit, onPaste: () -> Unit) {
+fun ReviewScreen(vm: MainVm, list: List<ReviewItem>, onAdd: (Fields) -> Unit) {
+    val clip = LocalClipboardManager.current
+    LazyColumn(contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        item {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text("Messages I looked at", style = MaterialTheme.typography.titleLarge, modifier = Modifier.weight(1f))
+                TextButton(onClick = { vm.review.value = null }) { Text("Close") }
+            }
+            Text(
+                "Green: understood and saved. Red: looks like KPLC but was not recognised. For red ones tap Add manually (fields are pre-filled) or Copy the text and send it to the developer.",
+                style = MaterialTheme.typography.bodySmall
+            )
+        }
+        if (list.isEmpty()) item { Text("No KPLC-looking messages found in your inbox.") }
+        items(list) { r ->
+            val ok = r.kind != null
+            Card(Modifier.fillMaxWidth(), colors = CardDefaults.cardColors(containerColor = if (ok) Color(0xFFE8F5E9) else Color(0xFFFFEBEE))) {
+                Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Text("${r.address} - ${fmtDate(r.date)}", fontWeight = FontWeight.Bold)
+                    Text(
+                        when (r.kind) {
+                            "TOKEN" -> "Understood as a token message"
+                            "PAYMENT" -> "Understood as a payment to KPLC"
+                            else -> "Not recognised"
+                        },
+                        style = MaterialTheme.typography.labelLarge
+                    )
+                    Text(r.body, style = MaterialTheme.typography.bodySmall)
+                    Row {
+                        TextButton(onClick = {
+                            clip.setText(AnnotatedString(r.body))
+                            vm.message.value = "Message copied"
+                        }) { Text("Copy") }
+                        if (!ok) TextButton(onClick = { onAdd(r.fields) }) { Text("Add manually") }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun MoreTab(vm: MainVm, onScan: () -> Unit, onPaste: () -> Unit, onReview: () -> Unit) {
     val ctx = LocalContext.current
     val threshold by vm.threshold.collectAsState()
     val backupLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/json")) { uri ->
@@ -592,6 +697,7 @@ fun MoreTab(vm: MainVm, onScan: () -> Unit, onPaste: () -> Unit) {
         HorizontalDivider()
         OutlinedButton(onClick = onScan, modifier = Modifier.fillMaxWidth()) { Text("Rescan messages") }
         OutlinedButton(onClick = onPaste, modifier = Modifier.fillMaxWidth()) { Text("Paste a token message") }
+        OutlinedButton(onClick = onReview, modifier = Modifier.fillMaxWidth()) { Text("Review scanned messages") }
         Text(
             "New KPLC token messages are saved automatically when they arrive. Home-screen widget: long-press your home screen and add the MyToken widget.",
             style = MaterialTheme.typography.bodySmall
@@ -629,13 +735,16 @@ fun TextDialog(
 @Composable
 fun ManualAddDialog(
     defaultMeter: String,
+    initialToken: String = "",
+    initialUnits: String = "",
+    initialAmount: String = "",
     onDismiss: () -> Unit,
     onSave: (String, String, Double, Double) -> Unit
 ) {
     var meter by remember { mutableStateOf(defaultMeter) }
-    var token by remember { mutableStateOf("") }
-    var units by remember { mutableStateOf("") }
-    var amount by remember { mutableStateOf("") }
+    var token by remember { mutableStateOf(initialToken) }
+    var units by remember { mutableStateOf(initialUnits) }
+    var amount by remember { mutableStateOf(initialAmount) }
     var error by remember { mutableStateOf<String?>(null) }
     val digits = token.filter { it.isDigit() }
 

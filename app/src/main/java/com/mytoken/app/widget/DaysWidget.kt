@@ -35,7 +35,8 @@ class DaysWidget : AppWidgetProvider() {
                     val tracked = dao.metersNow().filter { it.tracked }
                     val meter = tracked.firstOrNull { it.number == sel } ?: tracked.firstOrNull()
                     val all = dao.purchasesNow()
-                    val ins = meter?.let { m -> Insights.compute(m, all.filter { it.meterNumber == m.number }) }
+                    val allReadings = dao.readingsNow()
+                    val ins = meter?.let { m -> Insights.compute(m, all.filter { it.meterNumber == m.number }, allReadings.filter { it.meterNumber == m.number }) }
 
                     val rv = RemoteViews(ctx.packageName, R.layout.widget_days)
                     rv.setTextViewText(R.id.w_days, ins?.daysLeft?.let { "%.0f".format(it) } ?: "--")

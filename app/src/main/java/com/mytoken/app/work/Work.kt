@@ -56,9 +56,10 @@ class ReminderWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(c
         val dao = AppDb.get(ctx).dao()
         val meters = dao.metersNow().filter { it.tracked }
         val all = dao.purchasesNow()
+        val allReadings = dao.readingsNow()
         val threshold = Prefs.threshold(ctx)
         for (m in meters) {
-            val ins = Insights.compute(m, all.filter { it.meterNumber == m.number })
+            val ins = Insights.compute(m, all.filter { it.meterNumber == m.number }, allReadings.filter { it.meterNumber == m.number })
             val d = ins.daysLeft
             if (d != null && d <= threshold) {
                 Notifier.post(

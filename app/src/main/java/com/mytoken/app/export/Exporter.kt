@@ -8,6 +8,7 @@ import androidx.core.content.FileProvider
 import com.mytoken.app.data.AppDao
 import com.mytoken.app.data.Meter
 import com.mytoken.app.data.Purchase
+import com.mytoken.app.data.Reading
 import com.mytoken.app.data.display
 import org.json.JSONArray
 import org.json.JSONObject
@@ -23,7 +24,7 @@ object Exporter {
 
     fun csv(ctx: Context, meters: List<Meter>, purchases: List<Purchase>): File {
         val labels = meters.associate { it.number to it.display() }
-        val sb = StringBuilder("Date,Meter,Label,Token,Units,Amount (KES),KES per unit,Used\n")
+        val sb = StringBuilder("Date,Meter,Label,Token,Units,Amount (KES),KES per unit,Used,Type\n")
         purchases.sortedByDescending { it.dateMillis }.forEach { p ->
             val per = if (p.units > 0) "%.2f".format(Locale.US, p.amount / p.units) else ""
             sb.append(date(p.dateMillis)).append(',')
@@ -33,7 +34,7 @@ object Exporter {
                 .append("%.2f".format(Locale.US, p.units)).append(',')
                 .append("%.2f".format(Locale.US, p.amount)).append(',')
                 .append(per).append(',')
-                .append(if (p.used) "yes" else "no").append('\n')
+                .append(if (p.used) "yes" else "no").append(',').append(p.kind).append('\n')
         }
         return File(dir(ctx), "mytoken-history.csv").apply { writeText(sb.toString()) }
     }
@@ -84,7 +85,7 @@ object Exporter {
         ctx.startActivity(chooser)
     }
 
-    fun backupJson(meters: List<Meter>, purchases: List<Purchase>): String {
+    fun backupJson(meters: List<Meter>, purchases: List<Purchase>, readings: List<Reading>): String {
         val root = JSONObject()
         val ms = JSONArray()
         meters.forEach {
@@ -108,9 +109,14 @@ object Exporter {
                     .put("dateMillis", it.dateMillis)
                     .put("used", it.used)
                     .put("manual", it.manual)
+                    .put("kind", it.kind)
             )
         }
-        root.put("app", "MyToken").put("version", 1).put("meters", ms).put("purchases", ps)
+        val rs = JSONArray()
+        readings.forEach {
+            rs.put(JSONObject().put("meterNumber", it.meterNumber).put("units", it.units).put("atMillis", it.atMillis))
+        }
+        root.put("app", "MyToken").put("version", 2).put("meters", ms).put("purchases", ps).put("readings", rs)
         return root.toString(2)
     }
 
@@ -119,6 +125,7 @@ object Exporter {
         val ms = root.getJSONArray("meters")
         val ps = root.getJSONArray("purchases")
         dao.clearPurchases()
+        dao.clearReadings()
         dao.clearMeters()
         for (i in 0 until ms.length()) {
             val o = ms.getJSONObject(i)
@@ -142,9 +149,17 @@ object Exporter {
                     amount = o.getDouble("amount"),
                     dateMillis = o.getLong("dateMillis"),
                     used = o.optBoolean("used", false),
-                    manual = o.optBoolean("manual", false)
+                    manual = o.optBoolean("manual", false),
+                    kind = o.optString("kind", "TOKEN")
                 )
             )
+        }
+        val rr = root.optJSONArray("readings")
+        if (rr != null) {
+            for (i in 0 until rr.length()) {
+                val o = rr.getJSONObject(i)
+                dao.insertReading(Reading(meterNumber = o.getString("meterNumber"), units = o.getDouble("units"), atMillis = o.getLong("atMillis")))
+            }
         }
         return ps.length()
     }

@@ -9,17 +9,21 @@ import com.mytoken.app.data.AppDao
 import com.mytoken.app.data.AppDb
 import com.mytoken.app.data.Meter
 import com.mytoken.app.data.Purchase
+import com.mytoken.app.parser.Fields
+import com.mytoken.app.parser.Kind
 import com.mytoken.app.parser.KplcParser
 import com.mytoken.app.parser.ParsedToken
-import com.mytoken.app.work.Notifier
 import com.mytoken.app.widget.DaysWidget
+import com.mytoken.app.work.Notifier
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
+data class ReviewItem(val address: String, val date: Long, val body: String, val kind: String?, val fields: Fields)
+
 object SmsScanner {
-    /** Reads the SMS inbox and stores every KPLC token message found. Returns the number of NEW tokens. */
+    /** Reads the whole SMS inbox and stores every KPLC token message and KPLC payment found. Returns NEW records. */
     suspend fun scan(ctx: Context): Int = withContext(Dispatchers.IO) {
         val dao = AppDb.get(ctx).dao()
         var added = 0
@@ -38,6 +42,26 @@ object SmsScanner {
         added
     }
 
+    /** Lists the messages that look KPLC-related and how the app read each one. */
+    suspend fun review(ctx: Context): List<ReviewItem> = withContext(Dispatchers.IO) {
+        val out = mutableListOf<ReviewItem>()
+        val cursor = ctx.contentResolver.query(
+            Uri.parse("content://sms/inbox"),
+            arrayOf("body", "date", "address"),
+            null, null, "date DESC"
+        ) ?: return@withContext out
+        cursor.use { c ->
+            while (c.moveToNext() && out.size < 150) {
+                val body = c.getString(0) ?: continue
+                if (!KplcParser.looksRelevant(body)) continue
+                val date = c.getLong(1)
+                val parsed = KplcParser.parse(body, date)
+                out.add(ReviewItem(c.getString(2) ?: "?", date, body, parsed?.kind?.name, KplcParser.extract(body)))
+            }
+        }
+        out
+    }
+
     suspend fun save(dao: AppDao, p: ParsedToken): Boolean {
         val meter = p.meter ?: "UNKNOWN"
         dao.insertMeter(Meter(number = meter))
@@ -47,7 +71,8 @@ object SmsScanner {
                 token = p.token,
                 units = p.units ?: 0.0,
                 amount = p.amount ?: 0.0,
-                dateMillis = p.dateMillis
+                dateMillis = p.dateMillis,
+                kind = p.kind.name
             )
         )
         return id != -1L
@@ -67,8 +92,12 @@ class SmsReceiver : BroadcastReceiver() {
             try {
                 val dao = AppDb.get(context).dao()
                 if (SmsScanner.save(dao, parsed)) {
-                    val units = parsed.units?.let { " (%.1f units)".format(it) } ?: ""
-                    Notifier.post(context, 1001, "New KPLC token saved", "Meter ${parsed.meter ?: "unknown"}$units")
+                    if (parsed.kind == Kind.TOKEN) {
+                        val units = parsed.units?.let { " (%.1f units)".format(it) } ?: ""
+                        Notifier.post(context, 1001, "New KPLC token saved", "Meter ${parsed.meter ?: "unknown"}$units")
+                    } else {
+                        Notifier.post(context, 1002, "KPLC payment noted", "KES %.0f paid - waiting for the token message".format(parsed.amount ?: 0.0))
+                    }
                     DaysWidget.refresh(context)
                 }
             } finally {
